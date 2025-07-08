@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""
-DCC Internet P2P Blockchain Chat — versão threaded, single-file
-================================================================
-Implementa Partes 0–3 do enunciado sem usar asyncio. Cada conexão TCP
-funciona em sua própria Thread; o estado compartilhado (peers e blockchain)
-usa threading.Lock para sincronização.
 
-Uso (Linux):
-    sudo ip addr add 127.0.0.2/8 dev lo
-    python dcc_p2p_chat_thread.py --ip 127.0.0.2
-    python dcc_p2p_chat_thread.py --ip 127.0.0.3 --bootstrap 127.0.0.2
-"""
 
 import argparse
 import hashlib
@@ -91,13 +80,10 @@ class Blockchain:
     @staticmethod
     def _tail_valid(chats: List[Chat]) -> bool:
         tail = chats[-1]
-        # primeiro critério: dois bytes zero
         if tail.md5[:2] != b"\x00\x00":
             return False
-        # segundo: hash dos últimos ≤20 chats sem o md5 final
         window = chats[-20:]
-        blob = b"".join(c.pack() for c in window[:-1])
-        blob += tail.pack()[:-MD5LEN]
+        blob = b"".join(c.pack() for c in window[:-1]) + tail.pack()[:-MD5LEN]
         return hashlib.md5(blob).digest() == tail.md5
 
     def mine(self, text_ascii: str) -> "Blockchain":
@@ -108,8 +94,7 @@ class Blockchain:
             nonce = os.urandom(MD5LEN)
             digest = hashlib.md5(prev + prefix + nonce).digest()
             if digest[:2] == b"\x00\x00":
-                new_chat = Chat(txt, nonce, digest)
-                return Blockchain(self.chats + [new_chat])
+                return Blockchain(self.chats + [Chat(txt, nonce, digest)])
 
     def to_bytes(self) -> bytes:
         out = bytearray(_u32.pack(len(self.chats)))
@@ -171,15 +156,22 @@ class PeerConnection(threading.Thread):
                 if not code_raw:
                     break
                 code = code_raw[0]
+
                 if code == Msg.PEER_REQ:
                     self.send(pack_peer_list(self.node.known_peers()))
+
                 elif code == Msg.PEER_LIST:
                     self._handle_peer_list()
+
                 elif code == Msg.ARCH_REQ:
+                    # Responde ao pedido de histórico completo
                     self.send(pack_archive_response(self.node.bc.to_bytes()))
+
                 elif code == Msg.ARCH_RESP:
                     self._handle_archive_resp()
-                # NOTIFY handler could be added here
+
+                # poderá incluir Msg.NOTIFY aqui se desejar
+
         finally:
             self.node.drop_peer(self.ip)
             self.sock.close()
@@ -232,8 +224,11 @@ class Node:
                 p.send(pack_peer_request())
 
     def start(self):
+        # Thread de accept
         threading.Thread(target=self._accept_loop, daemon=True).start()
+        # Thread de PeerRequest periódico
         threading.Thread(target=self._peer_request_loop, daemon=True).start()
+        # Conecta ao bootstrap se fornecido
         if self.bootstrap and self.bootstrap != self.ip:
             self._connect(self.bootstrap)
         self.log(f"Node ready on {self.ip}:{PORT}")
@@ -254,7 +249,9 @@ class Node:
             self.peers[ip] = peer
         peer.start()
         self.log(f"Connected to {ip}")
-        # iniciamos troca de peers
+        # Puxa imediatamente o histórico completo
+        peer.send(pack_archive_request())
+        # Também dispara um PeerRequest para lista de peers
         peer.send(pack_peer_request())
 
     def drop_peer(self, ip: str):
