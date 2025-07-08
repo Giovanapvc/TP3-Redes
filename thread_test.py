@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-
-
 import argparse
 import hashlib
 import ipaddress
@@ -8,6 +6,7 @@ import os
 import socket
 import struct
 import threading
+import sys
 import time
 from enum import IntEnum
 from typing import Dict, List
@@ -18,10 +17,10 @@ from typing import Dict, List
 PORT = 51511
 PEER_REQUEST_PERIOD = 5    # segundos entre PeerRequest
 MD5LEN = 16                # bytes de nonce e hash
-MAX_CHAT_LEN = 255         # máximo de bytes ASCII no texto
+MAX_CHAT_LEN = 255
 
-_u8  = struct.Struct("!B")  # uint8 network order
-_u32 = struct.Struct("!I")  # uint32 network order
+_u8  = struct.Struct("!B")
+_u32 = struct.Struct("!I")
 
 class Msg(IntEnum):
     PEER_REQ  = 0x1
@@ -31,97 +30,24 @@ class Msg(IntEnum):
     NOTIFY    = 0x5
 
 # -------------------------------------------------------------------
-# Serialização de mensagens
+# Helpers de empacotamento (imutáveis)
 # -------------------------------------------------------------------
-def pack_peer_request() -> bytes:
-    return _u8.pack(Msg.PEER_REQ)
-
-def pack_peer_list(peers: List[str]) -> bytes:
+def pack_peer_request():       return _u8.pack(Msg.PEER_REQ)
+def pack_peer_list(peers):
     buf = bytearray(_u8.pack(Msg.PEER_LIST))
     buf += _u32.pack(len(peers))
     for ip in peers:
         buf += _u32.pack(int(ipaddress.IPv4Address(ip)))
     return bytes(buf)
 
-def pack_archive_request() -> bytes:
-    return _u8.pack(Msg.ARCH_REQ)
-
-def pack_archive_response(payload: bytes) -> bytes:
-    return _u8.pack(Msg.ARCH_RESP) + payload
-
-def pack_notify(msg: str) -> bytes:
-    data = msg.encode("ascii")[:MAX_CHAT_LEN]
-    return _u8.pack(Msg.NOTIFY) + _u8.pack(len(data)) + data
+def pack_archive_request():    return _u8.pack(Msg.ARCH_REQ)
+def pack_archive_response(b):  return _u8.pack(Msg.ARCH_RESP) + b
+def pack_notify(msg):
+    d = msg.encode("ascii")[:MAX_CHAT_LEN]
+    return _u8.pack(Msg.NOTIFY) + _u8.pack(len(d)) + d
 
 # -------------------------------------------------------------------
-# Blockchain & Chat
-# -------------------------------------------------------------------
-HEADER = _u8  # 1-byte length
-
-class Chat:
-    __slots__ = ("text", "nonce", "md5")
-    def __init__(self, text: bytes, nonce: bytes, md5: bytes):
-        self.text, self.nonce, self.md5 = text, nonce, md5
-    def pack(self) -> bytes:
-        return HEADER.pack(len(self.text)) + self.text + self.nonce + self.md5
-
-class Blockchain:
-    def __init__(self, chats: List[Chat] = None):
-        self.chats = list(chats) if chats else []
-
-    def valid(self) -> bool:
-        if not self.chats:
-            return True
-        for i in range(1, len(self.chats) + 1):
-            if not self._tail_valid(self.chats[:i]):
-                return False
-        return True
-
-    @staticmethod
-    def _tail_valid(chats: List[Chat]) -> bool:
-        tail = chats[-1]
-        if tail.md5[:2] != b"\x00\x00":
-            return False
-        window = chats[-20:]
-        blob = b"".join(c.pack() for c in window[:-1]) + tail.pack()[:-MD5LEN]
-        return hashlib.md5(blob).digest() == tail.md5
-
-    def mine(self, text_ascii: str) -> "Blockchain":
-        txt = text_ascii.encode("ascii")[:MAX_CHAT_LEN]
-        prefix = HEADER.pack(len(txt)) + txt
-        prev = b"".join(c.pack() for c in self.chats[-19:])
-        while True:
-            nonce = os.urandom(MD5LEN)
-            digest = hashlib.md5(prev + prefix + nonce).digest()
-            if digest[:2] == b"\x00\x00":
-                return Blockchain(self.chats + [Chat(txt, nonce, digest)])
-
-    def to_bytes(self) -> bytes:
-        out = bytearray(_u32.pack(len(self.chats)))
-        for c in self.chats:
-            out += c.pack()
-        return bytes(out)
-
-    @staticmethod
-    def from_socket(sock: socket.socket) -> "Blockchain":
-        raw = recvall(sock, _u32.size)
-        if raw is None:
-            raise ConnectionError
-        n, = _u32.unpack(raw)
-        chats: List[Chat] = []
-        for _ in range(n):
-            ln_raw = recvall(sock, 1); ln, = _u8.unpack(ln_raw)
-            txt   = recvall(sock, ln)
-            nonce = recvall(sock, MD5LEN)
-            md5   = recvall(sock, MD5LEN)
-            chats.append(Chat(txt, nonce, md5))
-        return Blockchain(chats)
-
-    def __len__(self):
-        return len(self.chats)
-
-# -------------------------------------------------------------------
-# IO utilitário
+# Helpers de leitura exata
 # -------------------------------------------------------------------
 def recvall(sock: socket.socket, n: int) -> bytes:
     buf = bytearray()
@@ -133,174 +59,223 @@ def recvall(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 # -------------------------------------------------------------------
-# Thread que representa um peer
+# Chat e Blockchain
 # -------------------------------------------------------------------
-class PeerConnection(threading.Thread):
-    def __init__(self, sock: socket.socket, ip: str, node: "Node"):
+HEADER = _u8
+
+class Chat:
+    __slots__ = ("text","nonce","md5")
+    def __init__(self, text, nonce, md5):
+        self.text, self.nonce, self.md5 = text, nonce, md5
+    def pack(self):
+        return HEADER.pack(len(self.text)) + self.text + self.nonce + self.md5
+
+class Blockchain:
+    def __init__(self, chats=None):
+        self.chats = chats[:] if chats else []
+
+    def valid(self):
+        if not self.chats: return True
+        for i in range(1, len(self.chats)+1):
+            if not self._tail_valid(self.chats[:i]): return False
+        return True
+
+    @staticmethod
+    def _tail_valid(ch):
+        tail = ch[-1]
+        if tail.md5[:2] != b"\x00\x00": return False
+        window = ch[-20:]
+        blob = b"".join(c.pack() for c in window[:-1]) + tail.pack()[:-MD5LEN]
+        return hashlib.md5(blob).digest() == tail.md5
+
+    def mine(self, txt_str):
+        txt = txt_str.encode("ascii")[:MAX_CHAT_LEN]
+        prefix = HEADER.pack(len(txt)) + txt
+        prev = b"".join(c.pack() for c in self.chats[-19:])
+        while True:
+            nonce = os.urandom(MD5LEN)
+            md5 = hashlib.md5(prev + prefix + nonce).digest()
+            if md5[:2] == b"\x00\x00":
+                return Blockchain(self.chats+[Chat(txt,nonce,md5)])
+
+    def to_bytes(self):
+        out = bytearray(_u32.pack(len(self.chats)))
+        for c in self.chats: out += c.pack()
+        return bytes(out)
+
+    @staticmethod
+    def from_stream(sock):
+        raw = recvall(sock, _u32.size)
+        if raw is None: raise ConnectionError
+        count, = _u32.unpack(raw)
+        chats = []
+        for _ in range(count):
+            ln_raw = recvall(sock, 1); ln, = _u8.unpack(ln_raw)
+            txt   = recvall(sock, ln)
+            nonce = recvall(sock, MD5LEN)
+            md5   = recvall(sock, MD5LEN)
+            chats.append(Chat(txt,nonce,md5))
+        return Blockchain(chats)
+
+    def __len__(self): return len(self.chats)
+
+# -------------------------------------------------------------------
+# Thread de conexão P2P
+# -------------------------------------------------------------------
+class PeerThread(threading.Thread):
+    def __init__(self, sock, ip, node):
         super().__init__(daemon=True)
-        self.sock = sock
-        self.ip = ip
-        self.node = node
+        self.sock, self.ip, self.node = sock, ip, node
         self.alive = True
 
-    def send(self, payload: bytes):
-        try:
-            self.sock.sendall(payload)
-        except OSError:
-            self.alive = False
+    def send(self, data: bytes):
+        try: self.sock.sendall(data)
+        except OSError: self.alive = False
 
     def run(self):
         try:
             while self.alive:
-                code_raw = recvall(self.sock, 1)
-                if not code_raw:
+                # ---------- 1) lê 1 byte (código) ----------
+                hdr = self.sock.recv(1)
+                if not hdr:
                     break
-                code = code_raw[0]
+                code = hdr[0]
 
+                # ---------- 2) dispatch por code ----------
                 if code == Msg.PEER_REQ:
                     self.send(pack_peer_list(self.node.known_peers()))
 
                 elif code == Msg.PEER_LIST:
-                    self._handle_peer_list()
+                    # lê 4 bytes: número N
+                    raw_n = recvall(self.sock, _u32.size)
+                    n, = _u32.unpack(raw_n)
+                    ips = []
+                    for _ in range(n):
+                        raw_ip = recvall(self.sock, _u32.size)
+                        ip_int, = _u32.unpack(raw_ip)
+                        ips.append(str(ipaddress.IPv4Address(ip_int)))
+                    self.node.merge_peers(ips)
 
                 elif code == Msg.ARCH_REQ:
-                    # Responde ao pedido de histórico completo
                     self.send(pack_archive_response(self.node.bc.to_bytes()))
 
                 elif code == Msg.ARCH_RESP:
-                    self._handle_archive_resp()
+                    # lê o histórico completo
+                    bc = Blockchain.from_stream(self.sock)
+                    self.node.consider_archive(bc)
 
-                # poderá incluir Msg.NOTIFY aqui se desejar
+                elif code == Msg.NOTIFY:
+                    # lê 1 byte len + msg
+                    ln_raw = recvall(self.sock, _u8.size)
+                    ln, = _u8.unpack(ln_raw)
+                    recvall(self.sock, ln)  # descarta ou trata
 
+                else:
+                    # código inesperado: descarta tudo
+                    self.alive = False
         finally:
-            self.node.drop_peer(self.ip)
+            self.node.drop(self.ip)
             self.sock.close()
 
-    def _handle_peer_list(self):
-        raw_n = recvall(self.sock, 4); n, = _u32.unpack(raw_n)
-        ips: List[str] = []
-        for _ in range(n):
-            raw_ip = recvall(self.sock, 4)
-            ip_int, = _u32.unpack(raw_ip)
-            ips.append(str(ipaddress.IPv4Address(ip_int)))
-        self.node.merge_peers(ips)
-
-    def _handle_archive_resp(self):
-        try:
-            bc = Blockchain.from_socket(self.sock)
-            self.node.consider_archive(bc)
-        except ConnectionError:
-            self.alive = False
-
 # -------------------------------------------------------------------
-# O nó principal
+# Nó principal
 # -------------------------------------------------------------------
 class Node:
-    def __init__(self, ip: str, bootstrap: str = None):
+    def __init__(self, ip, bootstrap=None):
         self.ip = ip
         self.bootstrap = bootstrap
         self.bc = Blockchain()
-        self.peers: Dict[str, PeerConnection] = {}
+        self.peers: Dict[str,PeerThread] = {}
         self.lock = threading.Lock()
 
-    def log(self, msg: str):
-        print(time.strftime("[%H:%M:%S]"), msg)
+    def start(self):
+        # accept loop
+        threading.Thread(target=self._accept, daemon=True).start()
+        # peer-request periódico
+        threading.Thread(target=self._ticker, daemon=True).start()
+        # connect inicial
+        if self.bootstrap and self.bootstrap != self.ip:
+            self._connect(self.bootstrap)
 
-    def _accept_loop(self):
+    def _accept(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((self.ip, PORT))
-        srv.listen(128)
+        srv.listen()
         while True:
             sock, addr = srv.accept()
             self._attach(sock, addr[0])
 
-    def _peer_request_loop(self):
+    def _ticker(self):
         while True:
             time.sleep(PEER_REQUEST_PERIOD)
             with self.lock:
-                peers_copy = list(self.peers.values())
-            for p in peers_copy:
-                p.send(pack_peer_request())
+                for p in list(self.peers.values()):
+                    p.send(pack_peer_request())
 
-    def start(self):
-        # Thread de accept
-        threading.Thread(target=self._accept_loop, daemon=True).start()
-        # Thread de PeerRequest periódico
-        threading.Thread(target=self._peer_request_loop, daemon=True).start()
-        # Conecta ao bootstrap se fornecido
-        if self.bootstrap and self.bootstrap != self.ip:
-            self._connect(self.bootstrap)
-        self.log(f"Node ready on {self.ip}:{PORT}")
-
-    def _connect(self, ip: str):
+    def _connect(self, host):
+        try:
+            addr = socket.gethostbyname(host)
+        except socket.gaierror:
+            addr = host
         with self.lock:
-            if ip in self.peers or ip == self.ip:
+            if addr in self.peers or addr == self.ip:
                 return
         try:
-            sock = socket.create_connection((ip, PORT), timeout=5)
+            sock = socket.create_connection((addr, PORT), timeout=5)
         except OSError:
             return
-        self._attach(sock, ip)
+        self._attach(sock, addr)
 
-    def _attach(self, sock: socket.socket, ip: str):
-        peer = PeerConnection(sock, ip, self)
+    def _attach(self, sock, ip):
+        p = PeerThread(sock, ip, self)
         with self.lock:
-            self.peers[ip] = peer
-        peer.start()
-        self.log(f"Connected to {ip}")
-        # Puxa imediatamente o histórico completo
-        peer.send(pack_archive_request())
-        # Também dispara um PeerRequest para lista de peers
-        peer.send(pack_peer_request())
+            self.peers[ip] = p
+        p.start()
+        # puxa histórico e peers
+        p.send(pack_archive_request())
+        p.send(pack_peer_request())
 
-    def drop_peer(self, ip: str):
+    def drop(self, ip):
         with self.lock:
             self.peers.pop(ip, None)
-        self.log(f"Peer {ip} disconnected")
 
-    def known_peers(self) -> List[str]:
+    def known_peers(self):
         with self.lock:
             return list(self.peers.keys()) + [self.ip]
 
-    def merge_peers(self, ips: List[str]):
+    def merge_peers(self, ips):
         for ip in ips:
             self._connect(ip)
 
     def consider_archive(self, bc: Blockchain):
-        if not bc.valid():
-            self.log("Received invalid archive")
-            return
-        with self.lock:
-            if len(bc) > len(self.bc):
-                self.bc = bc
-                raw = pack_archive_response(bc.to_bytes())
+        if bc.valid() and len(bc) > len(self.bc):
+            self.bc = bc
+            raw = pack_archive_response(bc.to_bytes())
+            with self.lock:
                 for p in self.peers.values():
                     p.send(raw)
-                self.log(f"Archive updated: {len(bc)} chats")
 
-    def chat(self, text: str):
-        self.log(f"Mining chat: '{text}'")
-        new_bc = self.bc.mine(text)
-        self.consider_archive(new_bc)
+    def chat(self, txt):
+        self.bc = self.bc.mine(txt)
+        raw = pack_archive_response(self.bc.to_bytes())
+        with self.lock:
+            for p in self.peers.values():
+                p.send(raw)
 
 # -------------------------------------------------------------------
 # CLI
 # -------------------------------------------------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="DCC P2P Chat – threaded node")
-    parser.add_argument("--ip", required=True, help="IPv4 local address")
-    parser.add_argument("--bootstrap", help="IP of an existing peer")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ip", required=True)
+    ap.add_argument("--bootstrap")
+    args = ap.parse_args()
 
     node = Node(args.ip, args.bootstrap)
     node.start()
 
-    try:
-        while True:
-            line = input("> ").strip()
-            if line:
-                node.chat(line)
-    except KeyboardInterrupt:
-        print()
-        node.log("Shutting down")
+    for line in sys.stdin:
+        line = line.strip()
+        if line:
+            node.chat(line)
