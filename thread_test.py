@@ -11,12 +11,10 @@ import time
 from enum import IntEnum
 from typing import Dict, List
 
-# -------------------------------------------------------------------
-# Configurações gerais
-# -------------------------------------------------------------------
+# General config
 PORT = 51511
-PEER_REQUEST_PERIOD = 5    # segundos entre PeerRequest
-MD5LEN = 16                # bytes de nonce e hash
+PEER_REQUEST_PERIOD = 5    # seconds between PeerRequest
+MD5LEN = 16                # nonce and hash bytes
 MAX_CHAT_LEN = 255
 
 _u8  = struct.Struct("!B")
@@ -29,10 +27,12 @@ class Msg(IntEnum):
     ARCH_RESP = 0x4
     NOTIFY    = 0x5
 
-# -------------------------------------------------------------------
-# Helpers de empacotamento (imutáveis)
-# -------------------------------------------------------------------
-def pack_peer_request():       return _u8.pack(Msg.PEER_REQ)
+# ----------------
+# Packing helpers
+# ----------------
+def pack_peer_request():
+    return _u8.pack(Msg.PEER_REQ)
+
 def pack_peer_list(peers):
     buf = bytearray(_u8.pack(Msg.PEER_LIST))
     buf += _u32.pack(len(peers))
@@ -40,15 +40,19 @@ def pack_peer_list(peers):
         buf += _u32.pack(int(ipaddress.IPv4Address(ip)))
     return bytes(buf)
 
-def pack_archive_request():    return _u8.pack(Msg.ARCH_REQ)
-def pack_archive_response(b):  return _u8.pack(Msg.ARCH_RESP) + b
+def pack_archive_request():
+    return _u8.pack(Msg.ARCH_REQ)
+
+def pack_archive_response(b):
+    return _u8.pack(Msg.ARCH_RESP) + b
+
 def pack_notify(msg):
     d = msg.encode("ascii")[:MAX_CHAT_LEN]
     return _u8.pack(Msg.NOTIFY) + _u8.pack(len(d)) + d
 
-# -------------------------------------------------------------------
-# Helpers de leitura exata
-# -------------------------------------------------------------------
+# ----------------
+# Reading helpers
+# ----------------
 def recvall(sock: socket.socket, n: int) -> bytes:
     buf = bytearray()
     while len(buf) < n:
@@ -58,9 +62,9 @@ def recvall(sock: socket.socket, n: int) -> bytes:
         buf += chunk
     return bytes(buf)
 
-# -------------------------------------------------------------------
-# Chat e Blockchain
-# -------------------------------------------------------------------
+# --------------------
+# Chat and Blockchain
+# --------------------
 HEADER = _u8
 
 class Chat:
@@ -75,15 +79,18 @@ class Blockchain:
         self.chats = chats[:] if chats else []
 
     def valid(self):
-        if not self.chats: return True
+        if not self.chats: 
+            return True
         for i in range(1, len(self.chats)+1):
-            if not self._tail_valid(self.chats[:i]): return False
+            if not self._tail_valid(self.chats[:i]): 
+                return False
         return True
 
     @staticmethod
     def _tail_valid(ch):
         tail = ch[-1]
-        if tail.md5[:2] != b"\x00\x00": return False
+        if tail.md5[:2] != b"\x00\x00": 
+            return False
         window = ch[-20:]
         blob = b"".join(c.pack() for c in window[:-1]) + tail.pack()[:-MD5LEN]
         return hashlib.md5(blob).digest() == tail.md5
@@ -100,13 +107,15 @@ class Blockchain:
 
     def to_bytes(self):
         out = bytearray(_u32.pack(len(self.chats)))
-        for c in self.chats: out += c.pack()
+        for c in self.chats: 
+            out += c.pack()
         return bytes(out)
 
     @staticmethod
     def from_stream(sock):
         raw = recvall(sock, _u32.size)
-        if raw is None: raise ConnectionError
+        if raw is None: 
+            raise ConnectionError
         count, = _u32.unpack(raw)
         chats = []
         for _ in range(count):
@@ -119,9 +128,9 @@ class Blockchain:
 
     def __len__(self): return len(self.chats)
 
-# -------------------------------------------------------------------
-# Thread de conexão P2P
-# -------------------------------------------------------------------
+# ----------------------
+# P2P connection thread
+# ----------------------
 class PeerThread(threading.Thread):
     def __init__(self, sock, ip, node):
         super().__init__(daemon=True)
@@ -135,18 +144,15 @@ class PeerThread(threading.Thread):
     def run(self):
         try:
             while self.alive:
-                # ---------- 1) lê 1 byte (código) ----------
                 hdr = self.sock.recv(1)
                 if not hdr:
                     break
                 code = hdr[0]
 
-                # ---------- 2) dispatch por code ----------
                 if code == Msg.PEER_REQ:
                     self.send(pack_peer_list(self.node.known_peers()))
 
                 elif code == Msg.PEER_LIST:
-                    # lê 4 bytes: número N
                     raw_n = recvall(self.sock, _u32.size)
                     n, = _u32.unpack(raw_n)
                     ips = []
@@ -160,26 +166,23 @@ class PeerThread(threading.Thread):
                     self.send(pack_archive_response(self.node.bc.to_bytes()))
 
                 elif code == Msg.ARCH_RESP:
-                    # lê o histórico completo
                     bc = Blockchain.from_stream(self.sock)
                     self.node.consider_archive(bc)
 
                 elif code == Msg.NOTIFY:
-                    # lê 1 byte len + msg
                     ln_raw = recvall(self.sock, _u8.size)
                     ln, = _u8.unpack(ln_raw)
-                    recvall(self.sock, ln)  # descarta ou trata
+                    recvall(self.sock, ln)  # drops or treat
 
                 else:
-                    # código inesperado: descarta tudo
-                    self.alive = False
+                    self.alive = False 
         finally:
             self.node.drop(self.ip)
             self.sock.close()
 
-# -------------------------------------------------------------------
-# Nó principal
-# -------------------------------------------------------------------
+# ----------
+# Main node
+# ----------
 class Node:
     def __init__(self, ip, bootstrap=None):
         self.ip = ip
@@ -189,12 +192,10 @@ class Node:
         self.lock = threading.Lock()
 
     def start(self):
-        # accept loop
         threading.Thread(target=self._accept, daemon=True).start()
-        # peer-request periódico
         threading.Thread(target=self._ticker, daemon=True).start()
-        # connect inicial
-        if self.bootstrap and self.bootstrap != self.ip:
+
+        if self.bootstrap and self.bootstrap != self.ip:    # Initial connect
             self._connect(self.bootstrap)
 
     def _accept(self):
@@ -232,8 +233,7 @@ class Node:
         with self.lock:
             self.peers[ip] = p
         p.start()
-        # puxa histórico e peers
-        p.send(pack_archive_request())
+        p.send(pack_archive_request())   # gets history and peers
         p.send(pack_peer_request())
 
     def drop(self, ip):
@@ -263,9 +263,33 @@ class Node:
             for p in self.peers.values():
                 p.send(raw)
 
-# -------------------------------------------------------------------
+    # Shows chat history on terminal
+    def print_history(self):
+        print("=== Chat History ===")
+        for idx, chat in enumerate(self.bc.chats, start=1):
+            txt = chat.text.decode("ascii", errors="ignore")
+            print(f"{idx:03d}: {txt}")
+        print("====================")
+
+    def print_detailed_history(self):
+        print("=== Chat History ===")
+        for idx, chat in enumerate(self.bc.chats, start=1):
+            size = len(chat.text)
+            msg_ascii = chat.text.decode("ascii", errors="ignore")
+            msg_hex = chat.text.hex()
+            nonce = chat.nonce.hex()
+            md5 = chat.md5.hex()
+            print(f"{idx:03d}:")
+            print(f"   Size: {size} bytes")
+            print(f"   Message (ASCII): {msg_ascii}")
+            print(f"   Message (hex): {msg_hex}")
+            print(f"   Verification code (nonce): {nonce}")
+            print(f"   Hash MD5: {md5}")
+        print("====================")
+
+# ----
 # CLI
-# -------------------------------------------------------------------
+# ----
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--ip", required=True)
@@ -277,5 +301,11 @@ if __name__ == "__main__":
 
     for line in sys.stdin:
         line = line.strip()
-        if line:
+        if not line:
+            continue
+        if line.lower() == "/history":
+            node.print_history()
+        if line.lower() == "/history detail":
+            node.print_detailed_history()
+        else:
             node.chat(line)
