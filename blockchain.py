@@ -257,6 +257,11 @@ class Node:
                     p.send(raw)
 
     def chat(self, txt):
+        try:
+            txt.encode("ascii")
+        except UnicodeEncodeError:
+            print("Invalid message! Use only ASCII characters.")
+            return
         self.bc = self.bc.mine(txt)
         raw = pack_archive_response(self.bc.to_bytes())
         with self.lock:
@@ -305,7 +310,7 @@ if __name__ == "__main__":
             continue
         if line.lower() == "/history":
             node.print_history()
-        if line.lower() == "/history detail":
+        elif line.lower() == "/history detail":
             node.print_detailed_history()
         else:
             node.chat(line)
